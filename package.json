@@ -1,0 +1,22 @@
+{
+  "name": "veeder-root-api",
+  "version": "1.0.0",
+  "description": "API para leer niveles de combustible de un Veeder-Root (TLS-3xx/4) y notificar por correo cuando el nivel esté bajo",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test:connection": "node src/testConnection.js",
+    "test:email": "node src/testEmail.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.3",
+    "jwks-rsa": "^3.2.2",
+    "mssql": "^12.7.0",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.14"
+  }
+}
