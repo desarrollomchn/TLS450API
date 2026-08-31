@@ -14,16 +14,17 @@ function buildTransport() {
 
 /**
  * Envía el correo de alerta de nivel bajo para un tanque.
- * @param {{name:string, id:number, volumeGallons:number, percent:number, capacityGallons:number}} tank
+ * @param {{name:string, id:number, stationName:string, volumeGallons:number, percent:number, capacityGallons:number}} tank
  */
 async function sendLowLevelAlert(tank) {
   const transporter = buildTransport();
 
-  const subject = `⛽ Nivel bajo — Tanque ${tank.id} (${tank.name}): ${tank.percent.toFixed(1)}%`;
+  const subject = `⛽ Nivel bajo — ${tank.stationName} / Tanque ${tank.id} (${tank.name}): ${tank.percent.toFixed(1)}%`;
   const html = `
     <h2>Alerta de nivel bajo de combustible</h2>
-    <p>El tanque <b>${tank.id} - ${tank.name}</b> reportó un nivel bajo el umbral configurado.</p>
+    <p>El tanque <b>${tank.id} - ${tank.name}</b> de la estación <b>${tank.stationName}</b> reportó un nivel bajo el umbral configurado.</p>
     <table cellpadding="6" style="border-collapse:collapse">
+      <tr><td><b>Estación</b></td><td>${tank.stationName}</td></tr>
       <tr><td><b>Volumen actual</b></td><td>${tank.volumeGallons.toFixed(0)} gal</td></tr>
       <tr><td><b>Capacidad</b></td><td>${tank.capacityGallons} gal</td></tr>
       <tr><td><b>% del tanque</b></td><td>${tank.percent.toFixed(1)}%</td></tr>

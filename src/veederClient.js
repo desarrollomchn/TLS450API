@@ -18,11 +18,20 @@ const SOH = 0x01;
 const ETX = 0x03;
 
 class VeederRootClient {
-  constructor({ host, port = 10001, timeoutMs = 8000, framing = 'soh-etx' } = {}) {
+  /**
+   * `volumeUnit` es config por sitio, no del protocolo: el I20100 no dice en qué
+   * unidad reporta, y confirmamos contra equipos reales que varía por estación
+   * (ver src/config/stationVolumeUnits.json) — las Texaco vienen en litros, el
+   * resto ya en galones. Default 'LITROS' porque tratar litros como si ya fueran
+   * galones infla el nivel reportado y puede tapar una alerta real; al revés
+   * (convertir de más) solo genera falsas alarmas, más seguro por defecto.
+   */
+  constructor({ host, port = 10001, timeoutMs = 8000, framing = 'soh-etx', volumeUnit = 'LITROS' } = {}) {
     this.host = host;
     this.port = port;
     this.timeoutMs = timeoutMs;
     this.framing = framing; // 'soh-etx' (TLS-450 PLUS) o 'plain' (texto + CR/LF)
+    this.volumeUnit = volumeUnit; // 'LITROS' o 'GALONES'
   }
 
   /**
@@ -80,7 +89,7 @@ class VeederRootClient {
    */
   async getTankInventory() {
     const rawResponse = await this._sendCommand('I20100');
-    const tanks = parseInventoryResponse(rawResponse);
+    const tanks = parseInventoryResponse(rawResponse, this.volumeUnit);
     return { rawResponse, tanks };
   }
 }
@@ -95,7 +104,15 @@ class VeederRootClient {
  *
  * Ajusta esta regex si tu equipo entrega las columnas en otro orden.
  */
-function parseInventoryResponse(raw) {
+const LITERS_TO_GALLONS = 1 / 3.78541;
+
+/**
+ * `volumeUnit` viene del cliente (config por sitio, ver stationVolumeUnits.json) —
+ * esta función solo aplica la conversión si corresponde, nunca la asume.
+ */
+function parseInventoryResponse(raw, volumeUnit = 'LITROS') {
+  const factor = volumeUnit === 'GALONES' ? 1 : LITERS_TO_GALLONS;
+
   const lines = raw
     .replace(/[\x02\x03]/g, '') // quita STX/ETX si vinieran incluidos
     .split(/\r?\n/)
@@ -113,9 +130,9 @@ function parseInventoryResponse(raw) {
       tanks.push({
         id: Number(id),
         product: product.trim(),
-        volumeGallons: Number(volume),
-        tcVolumeGallons: Number(tcVolume),
-        ullageGallons: Number(ullage),
+        volumeGallons: Number(volume) * factor,
+        tcVolumeGallons: Number(tcVolume) * factor,
+        ullageGallons: Number(ullage) * factor,
         heightInches: Number(height),
         waterInches: Number(water),
         temperatureF: Number(temp),

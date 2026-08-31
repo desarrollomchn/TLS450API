@@ -1,8 +1,0 @@
-{
-  "_comentario": "Ajusta esto con los tanques reales de tu sitio. 'id' debe coincidir con el número de tanque que reporta el Veeder-Root (1, 2, 3...). capacityGallons se usa para calcular el % de nivel si el equipo no lo entrega directamente.",
-  "tanks": [
-    { "id": 1, "name": "Regular", "capacityGallons": 10000, "lowLevelPercent": 20 },
-    { "id": 2, "name": "Premium", "capacityGallons": 8000, "lowLevelPercent": 20 },
-    { "id": 3, "name": "Diesel", "capacityGallons": 10000, "lowLevelPercent": 25 }
-  ]
-}

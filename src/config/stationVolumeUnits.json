@@ -1,0 +1,13 @@
+{
+  "_nota": "Config temporal por estación (comb_estaciones.Id -> unidad real que reporta su Veeder-Root). El protocolo I20100 no dice su unidad — 'confirmado: true' significa que se verificó contra el equipo real cruzando VOLUMEN y ALTURA con la geometría del tanque (ver sesión del 2026-08-31); 'confirmado: false' es una inferencia por patrón de marca (Texaco = litros, resto = galones) para una estación que seguía sin conexión al momento de armar esto. Verificar cuando conecte.",
+  "7": { "nombre": "TEXACO Victoria", "unidad": "LITROS", "confirmado": true },
+  "3": { "nombre": "TEXACO Estrella Este", "unidad": "LITROS", "confirmado": true },
+  "4": { "nombre": "TEXACO Aeropuerto", "unidad": "LITROS", "confirmado": true },
+  "2": { "nombre": "SHELL Millennium", "unidad": "GALONES", "confirmado": true },
+  "8": { "nombre": "UNO Expocentro", "unidad": "GALONES", "confirmado": true },
+  "10": { "nombre": "PUMA San Diego", "unidad": "GALONES", "confirmado": true },
+  "5": { "nombre": "TEXACO Villa Olímpica", "unidad": "LITROS", "confirmado": false },
+  "9": { "nombre": "TEXACO Toyos", "unidad": "LITROS", "confirmado": false },
+  "6": { "nombre": "UNO Cedros", "unidad": "GALONES", "confirmado": false },
+  "1": { "nombre": "UNO Choluteca", "unidad": "GALONES", "confirmado": false }
+}

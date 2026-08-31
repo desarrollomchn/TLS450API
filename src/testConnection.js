@@ -2,13 +2,21 @@ require('dotenv').config();
 const { VeederRootClient } = require('./veederClient');
 
 (async () => {
+  // Ya no hay un único VEEDER_HOST en .env (multi-estación) — el host de la
+  // estación a probar se pasa como argumento: npm run test:connection -- <host>
+  const host = process.argv[2];
+  if (!host) {
+    console.error('Uso: npm run test:connection -- <host-del-veeder-root>');
+    process.exit(1);
+  }
+
   const client = new VeederRootClient({
-    host: process.env.VEEDER_HOST,
+    host,
     port: Number(process.env.VEEDER_PORT || 10001),
     timeoutMs: Number(process.env.VEEDER_TIMEOUT_MS || 8000),
   });
 
-  console.log(`Conectando a ${process.env.VEEDER_HOST}:${process.env.VEEDER_PORT}...`);
+  console.log(`Conectando a ${host}:${process.env.VEEDER_PORT || 10001}...`);
 
   try {
     const { rawResponse, tanks } = await client.getTankInventory();
