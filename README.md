@@ -16,7 +16,9 @@ cp .env.example .env
 Edita `.env` con:
 - El puerto y timeout compartidos de conexión a los Veeder-Root (`VEEDER_PORT`,
   `VEEDER_TIMEOUT_MS`) — el host ya no se configura aquí, ver abajo.
-- Los datos SMTP para el envío de correos.
+- `AUTH_API_BASE_URL` y `CORREO_API_KEY` — todo correo (alertas de nivel bajo y
+  `npm run test:email`) se manda vía `POST /v1/correo` de AuthServiceApi, no
+  SMTP directo (ver sección 5.1). Ya no existen variables `SMTP_*`.
 - El correo de destino de compras (`MAIL_TO`).
 - La conexión a SQL Server (`MSSQL_SERVER`, `MSSQL_INSTANCE`, `MSSQL_DATABASE`,
   `MSSQL_USER`, `MSSQL_PASSWORD`, `MSSQL_TRUST_SERVER_CERTIFICATE`).
@@ -123,6 +125,19 @@ autenticación en `.env.example`).
 Si un tanque sigue bajo el umbral en consultas consecutivas, **no** se reenvía un
 correo cada vez — solo se vuelve a notificar después de `ALERT_COOLDOWN_HOURS`
 horas (configurable en `.env`). Esto evita saturar el buzón de compras.
+
+### 5.1 Cómo se envían
+
+Ningún correo usa SMTP directo — tanto las alertas de nivel bajo
+(`sendLowLevelAlert`) como el correo de prueba (`sendTestReport`, usado por
+`npm run test:email`) en `src/notifier.js` se mandan vía `POST /v1/correo` del
+**AuthServiceApi centralizado** (función `postCorreo`), autenticado con una API
+key propia (header `X-Api-Key: $CORREO_API_KEY`, no un JWT: ese endpoint lo
+llaman servicios backend, no usuarios logueados). El endpoint acepta HTML
+(`EsHtml: true`), así que ambos correos mantienen su formato con tabla/estilos.
+
+`nodemailer` fue removido del proyecto junto con las variables `SMTP_*` — ya no
+hay ningún camino SMTP directo, ni en producción ni en pruebas.
 
 ## 6. Notas sobre el protocolo Veeder-Root
 
