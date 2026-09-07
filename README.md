@@ -139,7 +139,38 @@ llaman servicios backend, no usuarios logueados). El endpoint acepta HTML
 `nodemailer` fue removido del proyecto junto con las variables `SMTP_*` — ya no
 hay ningún camino SMTP directo, ni en producción ni en pruebas.
 
-## 6. Notas sobre el protocolo Veeder-Root
+## 6. Retención de `comb_lecturas`
+
+Mientras el proceso esté corriendo, el cron interno inserta una fila en
+`comb_lecturas` por cada tanque de cada estación en **cada** ciclo (por defecto
+cada `POLL_INTERVAL_MINUTES` minutos) — no hay agregación, es detalle crudo. Sin
+purga esa tabla crece sin límite: con 10 estaciones activas hoy son ~3.600
+filas/día; al llegar a las 40 estaciones planeadas serán ~14.400 filas/día
+(~5.3M/año).
+
+La purga corre en el propio SQL Server, no en esta API, vía un job de
+**SQL Server Agent** (`sql/007_retention_index.sql`):
+
+- Borra en `comb_lecturas` todo lo anterior a **3 meses**, en lotes de 5.000
+  filas (evita bloqueos largos y que el log de transacciones explote de una
+  sola vez).
+- Corre todos los días a las **8:00 AM** — horario elegido a propósito para que,
+  si algo falla, alguien esté despierto para atenderlo (no de madrugada).
+- Necesita el índice `IX_comb_lecturas_CreatedAt` (incluido en el mismo script)
+  porque el índice existente (`TanqueId, CreatedAt`) no sirve para un filtro
+  solo por fecha.
+
+**Requisito en el servidor**: el servicio *SQL Server Agent* tiene que estar
+corriendo (y en arranque automático) en la instancia de `MonteCristoBO` — sin
+Agent activo el job queda creado pero nunca se dispara. Verificar con
+`services.msc` → "SQL Server Agent (<instancia>)".
+
+Si el volumen crece mucho más allá de lo planeado (varias decenas de millones
+de filas/año), evaluar particionado por fecha con `SWITCH` en vez de `DELETE`
+en lotes — la edición Enterprise ya lo soporta, pero hoy sería sobreingeniería
+para este volumen.
+
+## 7. Notas sobre el protocolo Veeder-Root
 
 - Comando usado: `I20100` (inventario de tanques).
 - Puerto TCP por defecto: `10001`.
@@ -151,7 +182,7 @@ hay ningún camino SMTP directo, ni en producción ni en pruebas.
   servicio, puedes correr este proyecto en una máquina/Raspberry Pi dentro de la
   misma red local que el controlador.
 
-## 7. Siguientes pasos sugeridos
+## 8. Siguientes pasos sugeridos
 
 - Agregar más canales de notificación (Slack/WhatsApp) reutilizando la misma
   lógica de `monitor.js` (solo hace falta otro módulo como `notifier.js`).
