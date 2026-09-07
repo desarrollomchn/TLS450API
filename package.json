@@ -8,6 +8,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "test:connection": "node src/testConnection.js",
+    "test:units": "node src/testUnits.js",
     "test:email": "node src/testEmail.js"
   },
   "dependencies": {

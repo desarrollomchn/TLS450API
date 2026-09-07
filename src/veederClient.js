@@ -92,6 +92,16 @@ class VeederRootClient {
     const tanks = parseInventoryResponse(rawResponse, this.volumeUnit);
     return { rawResponse, tanks };
   }
+
+  /**
+   * Envía cualquier comando de INQUIRY (solo lectura) y devuelve la respuesta
+   * cruda sin parsear — para scripts de diagnóstico puntuales (ver testUnits.js).
+   * NUNCA uses esto con un comando de escritura/configuración: este proyecto
+   * tiene prohibido modificar nada en el Veeder-Root real, solo consultar.
+   */
+  async sendRaw(command) {
+    return this._sendCommand(command);
+  }
 }
 
 /**
