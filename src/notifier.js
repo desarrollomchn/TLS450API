@@ -5,6 +5,12 @@ const { URL } = require('url');
 /** AuthServiceApi.AplicacionId para tls450 en auth_aplicaciones — identifica quién dispara el envío, solo para logging del lado de AuthServiceApi. */
 const CORREO_APLICACION_ID = 3;
 
+// Sin esto, un AuthServiceApi colgado deja el await de sendLowLevelAlert/sendTestReport
+// esperando indefinidamente — no bloquea otras estaciones (pollStation corre bajo
+// Promise.allSettled en monitor.js), pero sí retrasa sin límite las alertas del
+// resto de tanques de ESA estación en ESE ciclo.
+const CORREO_TIMEOUT_MS = 15000;
+
 /**
  * POST /v1/correo de AuthServiceApi — mismo certificado autofirmado en dev que
  * usa el JWKS de auth.js, por eso el mismo toggle AUTH_ALLOW_INSECURE_TLS.
@@ -46,6 +52,9 @@ function postCorreo({ destinatarios, asunto, mensaje, isHtml = false }) {
     );
 
     req.on('error', reject);
+    req.setTimeout(CORREO_TIMEOUT_MS, () => {
+      req.destroy(new Error(`POST /v1/correo no respondió en ${CORREO_TIMEOUT_MS}ms (timeout)`));
+    });
     req.write(body);
     req.end();
   });
