@@ -302,7 +302,7 @@ async function saveReadings(stationId, tanks) {
       .input('temperatureF', sql.Decimal(6, 2), tank.temperatureF)
       .query(
         `INSERT INTO comb_lecturas (TanqueId, Product, VolumeGallons, HeightInches, WaterInches, TemperatureF, CreatedAt)
-         VALUES (@tanqueId, @product, @volumeGallons, @heightInches, @waterInches, @temperatureF, GETDATE())`
+         VALUES (@tanqueId, @product, @volumeGallons, @heightInches, @waterInches, @temperatureF, GETUTCDATE())`
       );
   }
 }
