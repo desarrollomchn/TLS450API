@@ -149,9 +149,18 @@ app.patch('/tanks/:id/threshold', async (req, res) => {
 
 // GET /tanks/:id/history?stationId=&limit= -> histórico de lecturas de un tanque de una estación
 app.get('/tanks/:id/history', async (req, res) => {
+  const tankNumber = Number(req.params.id);
+  if (!Number.isInteger(tankNumber) || tankNumber <= 0) {
+    return res.status(400).json({ ok: false, error: ':id debe ser un entero positivo.' });
+  }
+  // Sin techo, ?limit= sin validar permitía un TOP contra comb_lecturas sin
+  // límite práctico — esa tabla ya crece a millones de filas (ver README, sección
+  // de retención). 500 alcanza de sobra para cualquier gráfico/exportación real.
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
+
   const comEstacionId = await resolveComEstacionId(req);
   if (!comEstacionId) return res.json([]);
-  const history = await getTankHistory(comEstacionId, Number(req.params.id), Number(req.query.limit) || 100);
+  const history = await getTankHistory(comEstacionId, tankNumber, limit);
   const traducido = history.map((r) => ({
     id: r.id,
     idTanque: r.tank_id,
