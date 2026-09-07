@@ -16,9 +16,29 @@ const cooldownHours = Number(process.env.ALERT_COOLDOWN_HOURS || 6);
 
 // comEstacionId -> VeederRootClient (una conexión TCP propia por estación)
 const clientsByStation = new Map();
-// comEstacionId -> true una vez que comb_tanques ya se sembró/corrigió con éxito en este proceso
-const seededStations = new Set();
+// comEstacionId -> promesa de seedStationTanks en curso o ya resuelta con éxito.
+// Es un Map de promesas (no un Set de booleanos) para que un cron y un
+// /tanks/check-now manual que caigan sobre la misma estación al mismo tiempo
+// esperen el MISMO seed en vez de disparar dos INSERT concurrentes — el patrón
+// check-then-act con un Set no es atómico entre el chequeo y el await.
+const seedingByStation = new Map();
 let stationsMeta = [];
+
+/**
+ * Asegura que comb_tanques esté sembrado/corregido para la estación, una sola
+ * vez por proceso — concurrente-safe: si dos llamadas caen a la vez, la segunda
+ * espera la promesa de la primera en vez de sembrar de nuevo. Si falla, se saca
+ * del Map para que el próximo poll pueda reintentar.
+ */
+function ensureStationSeeded(comEstacionId, tanks) {
+  let seeding = seedingByStation.get(comEstacionId);
+  if (!seeding) {
+    seeding = seedStationTanks(comEstacionId, tanks);
+    seeding.catch(() => seedingByStation.delete(comEstacionId));
+    seedingByStation.set(comEstacionId, seeding);
+  }
+  return seeding;
+}
 
 function titleCase(product) {
   return product.charAt(0) + product.slice(1).toLowerCase();
@@ -87,14 +107,11 @@ async function pollStation(station) {
 
   // La siembra/corrección de comb_tanques se hace en el primer poll exitoso de cada estación
   // en vez de un paso previo al arranque, para no bloquear las otras 4 si esta está offline hoy.
-  if (!seededStations.has(station.comEstacionId)) {
-    try {
-      await seedStationTanks(station.comEstacionId, tanks);
-      seededStations.add(station.comEstacionId);
-    } catch (err) {
-      console.error(`No se pudo sembrar comb_tanques para ${station.name}:`, err.message);
-      return;
-    }
+  try {
+    await ensureStationSeeded(station.comEstacionId, tanks);
+  } catch (err) {
+    console.error(`No se pudo sembrar comb_tanques para ${station.name}:`, err.message);
+    return;
   }
 
   await saveReadings(station.comEstacionId, tanks);
