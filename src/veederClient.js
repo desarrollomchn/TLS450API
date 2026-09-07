@@ -143,4 +143,16 @@ function parseInventoryResponse(raw, volumeUnit = 'LITROS') {
   return tanks;
 }
 
-module.exports = { VeederRootClient, parseInventoryResponse };
+/**
+ * % lleno derivado directo de lo que reportó el Veeder-Root en esta consulta
+ * (`volume` + `ullage` = capacidad programada en la consola), sin depender de
+ * `comb_capacidades`. Sirve como comparación contra el % oficial (que sí usa
+ * `comb_capacidades`, la fuente que dispara la alerta) — si difieren mucho,
+ * `comb_capacidades` probablemente está desactualizada para ese tanque.
+ */
+function percentFromUllage(volumeGallons, ullageGallons) {
+  const total = volumeGallons + ullageGallons;
+  return total > 0 ? (volumeGallons / total) * 100 : null;
+}
+
+module.exports = { VeederRootClient, parseInventoryResponse, percentFromUllage };

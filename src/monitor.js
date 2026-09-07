@@ -1,4 +1,4 @@
-const { VeederRootClient } = require('./veederClient');
+const { VeederRootClient, percentFromUllage } = require('./veederClient');
 const stationVolumeUnits = require('./config/stationVolumeUnits.json');
 const {
   resolveActiveStations,
@@ -13,7 +13,6 @@ const {
 const { sendLowLevelAlert } = require('./notifier');
 
 const cooldownHours = Number(process.env.ALERT_COOLDOWN_HOURS || 6);
-const defaultThreshold = Number(process.env.DEFAULT_LOW_LEVEL_PERCENT || 20);
 
 // comEstacionId -> VeederRootClient (una conexión TCP propia por estación)
 const clientsByStation = new Map();
@@ -48,8 +47,6 @@ async function initStations() {
       console.warn(
         `${station.name}: sin entrada en stationVolumeUnits.json — asumiendo LITROS (default seguro, ver veederClient.js).`
       );
-    } else if (!unitConfig.confirmado) {
-      console.warn(`${station.name}: unidad '${unitConfig.unidad}' sin confirmar todavía (inferida por marca) — revisar cuando conecte.`);
     }
 
     clientsByStation.set(
@@ -57,7 +54,7 @@ async function initStations() {
       new VeederRootClient({
         host: station.host,
         port: Number(process.env.VEEDER_PORT || 10001),
-        timeoutMs: Number(process.env.VEEDER_TIMEOUT_MS || 8000),
+        timeoutMs: Number(process.env.VEEDER_TIMEOUT_MS || 12000),
         volumeUnit: unitConfig?.unidad,
       })
     );
@@ -103,20 +100,34 @@ async function pollStation(station) {
   await saveReadings(station.comEstacionId, tanks);
 
   const capacities = await getStationCapacities(station.comEstacionId);
+  const tankMeta = await getTankMetaByStation(station.comEstacionId);
 
   for (const tank of tanks) {
-    const capacityGallons = capacities.get(tank.product.toUpperCase());
+    // % ES SIEMPRE percentFromUllage — única fórmula, viene del propio Veeder-Root
+    // en esta consulta y no depende de que comb_capacidades esté cargada/actualizada.
+    const percent = percentFromUllage(tank.volumeGallons, tank.ullageGallons);
+    const capacityGallons = capacities.get(tank.product.toUpperCase()) ?? null;
 
-    if (!capacityGallons) {
-      console.warn(
-        `${station.name}: tanque ${tank.id} (${tank.product}) no tiene capacidad configurada — se omite la verificación de umbral.`
-      );
+    // comb_capacidades ya NO decide la alerta — queda solo como chequeo de fondo:
+    // si difiere mucho del % real del Veeder-Root, probablemente está desactualizada.
+    if (capacityGallons) {
+      const percentCapacidad = (tank.volumeGallons / capacityGallons) * 100;
+      if (Math.abs(percent - percentCapacidad) > 5) {
+        console.warn(
+          `${station.name}: tanque ${tank.id} (${tank.product}) — % Veeder-Root (${percent.toFixed(1)}%) difiere >5pts de % comb_capacidades (${percentCapacidad.toFixed(1)}%), revisar capacidad configurada.`
+        );
+      }
+    } else {
+      console.warn(`${station.name}: tanque ${tank.id} (${tank.product}) no tiene capacidad en comb_capacidades — sin dato para comparar.`);
+    }
+
+    const threshold = tankMeta.get(tank.id)?.low_level_percent;
+    if (threshold == null) {
+      console.warn(`${station.name}: tanque ${tank.id} (${tank.product}) sin umbral configurado en comb_tanques — no se evalúa alerta.`);
       continue;
     }
 
-    const percent = (tank.volumeGallons / capacityGallons) * 100;
-
-    if (percent <= defaultThreshold) {
+    if (percent <= threshold) {
       const lastAlert = await getLastAlert(station.comEstacionId, tank.id);
       const canAlertAgain = !lastAlert || hoursSince(lastAlert.sent_at) >= cooldownHours;
 
