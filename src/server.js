@@ -81,14 +81,44 @@ app.get('/tanks', async (req, res) => {
   res.json(readings.map(enrichReading));
 });
 
-// GET /tanks/live?stationId= -> consulta el Veeder-Root de la estación AHORA MISMO,
-// sin pasar por comb_lecturas. Para debug/demo — le pega directo al equipo real en
-// cada pedido, no usar como refresco de alta frecuencia en producción.
+// Cache corto de las lecturas EN VIVO, compartido por estación. El frontend pollea
+// /tanks/live cada 10s (LIVE_REFRESH_MS en useTanks.ts) — sin esto, cada empleado que
+// tenga la pantalla de Tanques abierta para la misma estación dispara su propia
+// conexión TCP nueva contra el Veeder-Root real (ver _sendCommand en veederClient.js:
+// abre y destruye un socket por consulta). El TTL queda apenas por debajo de esos 10s
+// para que N viewers de la misma estación compartan UNA sola consulta real al equipo
+// por ciclo, en vez de N. Se cachea la PROMESA (no el resultado ya resuelto) para que
+// también se compartan los pedidos que llegan mientras la consulta todavía está en
+// vuelo, no solo los que llegan después de que terminó. Queda por encima de los
+// 15s de LIVE_REFRESH_MS (useTanks.ts) con margen de sobra, no apenas por debajo:
+// así un pedido que llegue con algo de jitter de red/reloj sigue cayendo dentro
+// de la ventana del cache en vez de gatillar una consulta real de más.
+const LIVE_READINGS_CACHE_TTL_MS = 20000;
+const liveReadingsCache = new Map();
+
+function getCachedLiveReadings(comEstacionId) {
+  const cached = liveReadingsCache.get(comEstacionId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.promise;
+  }
+
+  const promise = getLiveReadings(comEstacionId);
+  // Un fallo no debe quedar cacheado por todo el TTL — el próximo pedido (de
+  // cualquier viewer) tiene que poder reintentar contra el equipo de una,
+  // no esperar a que expire la ventana de una consulta que ya sabemos que falló.
+  promise.catch(() => liveReadingsCache.delete(comEstacionId));
+  liveReadingsCache.set(comEstacionId, { promise, expiresAt: Date.now() + LIVE_READINGS_CACHE_TTL_MS });
+  return promise;
+}
+
+// GET /tanks/live?stationId= -> consulta el Veeder-Root de la estación (cacheado
+// LIVE_READINGS_CACHE_TTL_MS ms, compartido entre todos los viewers de la misma
+// estación), sin pasar por comb_lecturas.
 app.get('/tanks/live', async (req, res) => {
   const comEstacionId = await resolveComEstacionId(req);
   if (!comEstacionId) return res.json([]);
   try {
-    const readings = await getLiveReadings(comEstacionId);
+    const readings = await getCachedLiveReadings(comEstacionId);
     res.json(readings.map(enrichReading));
   } catch (err) {
     res.status(502).json({ ok: false, error: err.message });
