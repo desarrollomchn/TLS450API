@@ -5,12 +5,34 @@ const cron = require('node-cron');
 
 const { runOnce, initStations, getLiveReadings } = require('./monitor');
 const db = require('./db');
-const { getLatestReadings, getTankHistory, getActiveStationsList, updateTankThreshold } = db;
+const {
+  getLatestReadings,
+  getTankHistory,
+  getAllActiveFuelStations,
+  getComEstacionIdForEstacion,
+  getControladorVenta,
+  updateTankThreshold,
+} = db;
+const voxClient = require('./voxClient');
 const { requireAuth } = require('./auth');
 
 const app = express();
 const PORT = process.env.API_PORT || 3000;
-const DEFAULT_STATION_ID = 7; // Victoria, la estación piloto — mantiene compatibilidad con llamadas sin ?stationId
+// EstacionId (gen_estaciones.Id) de TEXACO Victoria, la estación piloto — mantiene
+// compatibilidad con llamadas sin ?stationId. Antes de este cambio esta constante
+// era comEstacionId (comb_estaciones.Id) = 7 para la misma estación; el id público
+// que usa toda la API ahora es EstacionId, no comEstacionId.
+const DEFAULT_STATION_ID = 4;
+
+/**
+ * Traduce el EstacionId recibido en la query (?stationId=) al comEstacionId real
+ * que usan las tablas de tanques (comb_tanques/comb_lecturas/comb_alertas). undefined
+ * si esa estación no tiene Veeder-Root — caso válido, no un error.
+ */
+async function resolveComEstacionId(req) {
+  const estacionId = Number(req.query.stationId) || DEFAULT_STATION_ID;
+  return getComEstacionIdForEstacion(estacionId);
+}
 
 // Misma forma de respuesta para /tanks (última lectura guardada) y /tanks/live
 // (consulta directa al equipo) — el frontend no necesita distinguirlas.
@@ -42,15 +64,20 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
 app.use(requireAuth);
 
-// GET /stations -> estaciones activas (backend del selector de estación en el frontend)
-app.get('/stations', (req, res) => {
-  res.json(getActiveStationsList());
+// GET /stations -> TODAS las estaciones activas (Veeder-Root y/o controlador de
+// venta), backend del selector de estación en el frontend. El id es EstacionId
+// (gen_estaciones.Id) — ya no comEstacionId, para poder listar también las
+// estaciones que todavía no tienen Veeder-Root.
+app.get('/stations', async (req, res) => {
+  res.json(await getAllActiveFuelStations());
 });
 
 // GET /tanks?stationId= -> última lectura de cada tanque de la estación + % calculado
+// (stationId acá es EstacionId, no comEstacionId — ver resolveComEstacionId).
 app.get('/tanks', async (req, res) => {
-  const stationId = Number(req.query.stationId) || DEFAULT_STATION_ID;
-  const readings = await getLatestReadings(stationId);
+  const comEstacionId = await resolveComEstacionId(req);
+  if (!comEstacionId) return res.json([]); // estación válida, sin Veeder-Root: no tiene tanques.
+  const readings = await getLatestReadings(comEstacionId);
   res.json(readings.map(enrichReading));
 });
 
@@ -58,9 +85,10 @@ app.get('/tanks', async (req, res) => {
 // sin pasar por comb_lecturas. Para debug/demo — le pega directo al equipo real en
 // cada pedido, no usar como refresco de alta frecuencia en producción.
 app.get('/tanks/live', async (req, res) => {
-  const stationId = Number(req.query.stationId) || DEFAULT_STATION_ID;
+  const comEstacionId = await resolveComEstacionId(req);
+  if (!comEstacionId) return res.json([]);
   try {
-    const readings = await getLiveReadings(stationId);
+    const readings = await getLiveReadings(comEstacionId);
     res.json(readings.map(enrichReading));
   } catch (err) {
     res.status(502).json({ ok: false, error: err.message });
@@ -70,16 +98,19 @@ app.get('/tanks/live', async (req, res) => {
 // PATCH /tanks/:id/threshold?stationId= -> actualiza el umbral de alerta (%) de un tanque.
 // Body: { umbralAlertaPorcentaje: number }
 app.patch('/tanks/:id/threshold', async (req, res) => {
-  const stationId = Number(req.query.stationId) || DEFAULT_STATION_ID;
+  const comEstacionId = await resolveComEstacionId(req);
   const tankNumber = Number(req.params.id);
   const { umbralAlertaPorcentaje } = req.body;
 
   if (typeof umbralAlertaPorcentaje !== 'number' || Number.isNaN(umbralAlertaPorcentaje) || umbralAlertaPorcentaje < 0 || umbralAlertaPorcentaje > 100) {
     return res.status(400).json({ ok: false, error: 'umbralAlertaPorcentaje debe ser un número entre 0 y 100.' });
   }
+  if (!comEstacionId) {
+    return res.status(404).json({ ok: false, error: 'Esa estación no tiene Veeder-Root — no hay tanques que actualizar.' });
+  }
 
   try {
-    await updateTankThreshold(stationId, tankNumber, umbralAlertaPorcentaje);
+    await updateTankThreshold(comEstacionId, tankNumber, umbralAlertaPorcentaje);
     res.json({ ok: true });
   } catch (err) {
     res.status(404).json({ ok: false, error: err.message });
@@ -88,8 +119,9 @@ app.patch('/tanks/:id/threshold', async (req, res) => {
 
 // GET /tanks/:id/history?stationId=&limit= -> histórico de lecturas de un tanque de una estación
 app.get('/tanks/:id/history', async (req, res) => {
-  const stationId = Number(req.query.stationId) || DEFAULT_STATION_ID;
-  const history = await getTankHistory(stationId, Number(req.params.id), Number(req.query.limit) || 100);
+  const comEstacionId = await resolveComEstacionId(req);
+  if (!comEstacionId) return res.json([]);
+  const history = await getTankHistory(comEstacionId, Number(req.params.id), Number(req.query.limit) || 100);
   const traducido = history.map((r) => ({
     id: r.id,
     idTanque: r.tank_id,
@@ -103,11 +135,95 @@ app.get('/tanks/:id/history', async (req, res) => {
   res.json(traducido);
 });
 
+// Cache corto del reporte YA parseado, por combinación exacta de filtros. Sin esto,
+// cada vez que el usuario da "Siguiente página" el backend volvería a pegarle
+// completo a VOX (~20-30s) solo para servir una página distinta del mismo resultado
+// que ya trajo segundos antes. 5 minutos alcanza para que alguien navegue todas las
+// páginas de una búsqueda sin golpear el equipo de nuevo; cambiar cualquier filtro
+// (incluida la fecha) es un cache miss y vuelve a consultar VOX, como corresponde.
+const DISPATCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const dispatchReportCache = new Map();
+
+function dispatchCacheKey(estacionId, from, to, productos, surtidores) {
+  return JSON.stringify([estacionId, from.toISOString(), to.toISOString(), productos ?? null, surtidores ?? null]);
+}
+
+async function getCachedDispatchReport(estacionId, credenciales, from, to, filters) {
+  const key = dispatchCacheKey(estacionId, from, to, filters.productos, filters.surtidores);
+  const cached = dispatchReportCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.report;
+  }
+
+  const report = await voxClient.getDispatchReport(credenciales, from, to, filters);
+  dispatchReportCache.set(key, { report, expiresAt: Date.now() + DISPATCH_CACHE_TTL_MS });
+  return report;
+}
+
+// GET /stations/:estacionId/dispatches?from=&to=&productos=&surtidores=&page=&pageSize=
+// -> despachos de bomba de un controlador de venta (VOX por ahora; Fusion todavía no
+// está implementado). from/to son ISO 8601. productos/surtidores son listas separadas
+// por coma (ej. productos=SUPER,DIESEL&surtidores=1,3) — si se omiten, trae todos.
+// VOX no pagina del lado del servidor: pedimos el rango completo UNA vez y paginamos
+// acá sobre el array ya parseado.
+app.get('/stations/:estacionId/dispatches', async (req, res) => {
+  const estacionId = Number(req.params.estacionId);
+  const from = new Date(req.query.from);
+  const to = new Date(req.query.to);
+
+  if (Number.isNaN(estacionId)) {
+    return res.status(400).json({ ok: false, error: 'estacionId inválido.' });
+  }
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) {
+    return res.status(400).json({ ok: false, error: 'from/to deben ser fechas ISO válidas, con from anterior o igual a to.' });
+  }
+
+  const credenciales = await getControladorVenta(estacionId);
+  if (!credenciales) {
+    return res.status(404).json({ ok: false, error: 'Esa estación no tiene controlador de venta registrado.' });
+  }
+  if (credenciales.sistema !== 'VOX') {
+    return res.status(501).json({ ok: false, error: `Sistema '${credenciales.sistema}' todavía no está soportado (solo VOX por ahora).` });
+  }
+
+  const productos = req.query.productos ? String(req.query.productos).split(',') : undefined;
+  const surtidores = req.query.surtidores ? String(req.query.surtidores).split(',').map(Number) : undefined;
+
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 50));
+
+  try {
+    const report = await getCachedDispatchReport(estacionId, credenciales, from, to, { productos, surtidores });
+
+    const start = (page - 1) * pageSize;
+    const records = report.records.slice(start, start + pageSize);
+
+    res.json({
+      records,
+      totales: report.totals,
+      ventasSinControl: report.ventasSinControl,
+      cantidadDespachos: report.cantidadDespachos,
+      pagina: page,
+      tamanoPagina: pageSize,
+      totalRegistros: report.records.length,
+      totalPaginas: Math.ceil(report.records.length / pageSize) || 1,
+    });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err.message });
+  }
+});
+
 // POST /tanks/check-now?stationId= -> fuerza una consulta inmediata (todas las estaciones, o una sola)
 app.post('/tanks/check-now', async (req, res) => {
   try {
-    const stationId = req.query.stationId ? Number(req.query.stationId) : undefined;
-    await runOnce(stationId);
+    let comEstacionId;
+    if (req.query.stationId) {
+      comEstacionId = await getComEstacionIdForEstacion(Number(req.query.stationId));
+      if (!comEstacionId) {
+        return res.status(404).json({ ok: false, error: 'Esa estación no tiene Veeder-Root — no hay nada que consultar.' });
+      }
+    }
+    await runOnce(comEstacionId);
     res.json({ ok: true, message: 'Consulta ejecutada' });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });

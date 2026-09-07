@@ -1,4 +1,5 @@
 const sql = require('mssql');
+const { decrypt } = require('./crypto');
 
 const config = {
   server: process.env.MSSQL_SERVER,
@@ -14,6 +15,12 @@ const config = {
 
 const pool = new sql.ConnectionPool(config);
 const poolConnect = pool.connect();
+
+// Umbral inicial SOLO para cuando se crea una fila de comb_tanques por primera vez
+// (no hay valor previo que preservar). De ahí en más, el único umbral que existe es
+// comb_tanques.LowLevelPercent — no hay variable de entorno que lo reemplace ni lo
+// pise; monitor.js decide la alerta exclusivamente con ese valor por tanque.
+const DEFAULT_LOW_LEVEL_PERCENT = 20;
 
 // stationId (comb_estaciones.Id) -> Map<TankNumber, TanqueId>. Ahora hay una entrada
 // por estación activa, en vez de un único mapa plano para todo el proceso.
@@ -53,6 +60,58 @@ async function resolveActiveStations() {
 
 function getActiveStationsList() {
   return cachedStations.map((s) => ({ id: s.comEstacionId, name: s.name }));
+}
+
+/**
+ * TODAS las estaciones activas con algún equipo monitoreado (Veeder-Root y/o
+ * controlador de venta VOX/Fusion/etc.) — a diferencia de resolveActiveStations(),
+ * que es exclusivamente para el poller de Veeder-Root (monitor.js) y por eso solo
+ * lista estaciones con comb_estaciones. Para el selector de estación del frontend:
+ * una estación sin Veeder-Root pero con VOX/Fusion debe aparecer igual.
+ *
+ * El id devuelto es SIEMPRE EstacionId (gen_estaciones.Id) — es el único identificador
+ * que existe para las estaciones sin Veeder-Root, así que es el que usa toda la API
+ * pública desde este cambio en adelante (ver DEFAULT_STATION_ID en server.js).
+ *
+ * Excluye a propósito estaciones de gen_estaciones que no son gasolineras (oficinas,
+ * hacienda, etc.) filtrando por "tiene al menos un equipo relevado" en vez de por
+ * Activo=1 solo — gen_estaciones también tiene filas no relacionadas a combustible.
+ */
+async function getAllActiveFuelStations() {
+  await poolConnect;
+  const result = await pool.request().query(`
+    SELECT
+      ge.Id AS estacionId,
+      ge.Nombre AS nombre,
+      CASE WHEN ce.Id IS NOT NULL THEN 1 ELSE 0 END AS tieneVeederRoot,
+      CASE WHEN cv.Id IS NOT NULL THEN 1 ELSE 0 END AS tieneControladorVenta
+    FROM gen_estaciones ge
+    LEFT JOIN comb_estaciones ce ON ce.EstacionId = ge.Id AND ce.Activo = 1
+    LEFT JOIN comb_controladores_venta cv ON cv.EstacionId = ge.Id AND cv.Activo = 1
+    WHERE ge.Activo = 1 AND (ce.Id IS NOT NULL OR cv.Id IS NOT NULL)
+    ORDER BY ge.Orden
+  `);
+
+  return result.recordset.map((r) => ({
+    id: r.estacionId,
+    name: r.nombre.replace(/^TEXACO\s*/i, '').trim(),
+    tieneVeederRoot: Boolean(r.tieneVeederRoot),
+    tieneControladorVenta: Boolean(r.tieneControladorVenta),
+  }));
+}
+
+/**
+ * Resuelve comEstacionId (comb_estaciones.Id) a partir de EstacionId (gen_estaciones.Id).
+ * Devuelve undefined si esa estación no tiene Veeder-Root — es un caso válido, no un
+ * error: la estación existe, simplemente no tiene tanques que consultar.
+ */
+async function getComEstacionIdForEstacion(estacionId) {
+  await poolConnect;
+  const result = await pool
+    .request()
+    .input('estacionId', sql.Int, estacionId)
+    .query('SELECT Id FROM comb_estaciones WHERE EstacionId = @estacionId AND Activo = 1');
+  return result.recordset[0]?.Id;
 }
 
 function tanqueIdFor(stationId, tankNumber) {
@@ -114,7 +173,7 @@ async function preSeedStationTanksFromCapacities(comEstacionId) {
   const capacities = await getStationCapacities(comEstacionId);
   if (capacities.size === 0) return;
 
-  const lowLevelPercent = Number(process.env.DEFAULT_LOW_LEVEL_PERCENT || 20);
+  const lowLevelPercent = DEFAULT_LOW_LEVEL_PERCENT;
   const existing = await pool
     .request()
     .input('comEstacionId', sql.Int, comEstacionId)
@@ -159,7 +218,7 @@ async function seedStationTanks(comEstacionId, discoveredTanks) {
     return;
   }
 
-  const lowLevelPercent = Number(process.env.DEFAULT_LOW_LEVEL_PERCENT || 20);
+  const lowLevelPercent = DEFAULT_LOW_LEVEL_PERCENT;
 
   for (const tank of discoveredTanks) {
     const product = tank.product.toUpperCase();
@@ -325,7 +384,7 @@ async function getLastAlert(stationId, tankNumber) {
     .request()
     .input('tanqueId', sql.Int, tanqueId)
     .query(
-      `SELECT TOP 1 VolumeGallons AS volume_gallons, PercentageLevel AS percent, SentAt AS sent_at
+      `SELECT TOP 1 VolumeGallons AS volume_gallons, PercentageLevel AS [percent], SentAt AS sent_at
        FROM comb_alertas
        WHERE TanqueId = @tanqueId
        ORDER BY SentAt DESC`
@@ -347,7 +406,7 @@ async function recordAlert(stationId, tankNumber, volumeGallons, percent) {
     .input('percent', sql.Decimal(5, 2), percent)
     .query(
       `INSERT INTO comb_alertas (TanqueId, VolumeGallons, PercentageLevel, SentAt)
-       VALUES (@tanqueId, @volumeGallons, @percent, GETDATE())`
+       VALUES (@tanqueId, @volumeGallons, @percent, GETUTCDATE())`
     );
 }
 
@@ -378,9 +437,41 @@ async function updateTankThreshold(stationId, tankNumber, lowLevelPercent) {
   // que no hace falta invalidar nada acá.
 }
 
+/**
+ * Credenciales (descifradas) del controlador de venta (VOX/Fusion/ALVIC) de una estación.
+ * Se busca por EstacionId (gen_estaciones.Id) — NO por comEstacionId (comb_estaciones.Id):
+ * la mayoría de las estaciones con controlador de venta todavía no tienen Veeder-Root,
+ * así que no tienen fila en comb_estaciones (ver sql/008_create_comb_controladores_venta.sql).
+ * Devuelve undefined si la estación no tiene controlador registrado o está inactivo.
+ */
+async function getControladorVenta(estacionId) {
+  await poolConnect;
+  const result = await pool
+    .request()
+    .input('estacionId', sql.Int, estacionId)
+    .query(
+      `SELECT Sistema AS sistema, Ip AS ip, Usuario AS usuario, PasswordCifrado AS passwordCifrado, Iv AS iv, AuthTag AS authTag
+       FROM comb_controladores_venta
+       WHERE EstacionId = @estacionId AND Activo = 1`
+    );
+
+  const row = result.recordset[0];
+  if (!row) return undefined;
+
+  return {
+    sistema: row.sistema,
+    ip: row.ip,
+    usuario: row.usuario,
+    password: decrypt({ cipherText: row.passwordCifrado, iv: row.iv, authTag: row.authTag }),
+  };
+}
+
 module.exports = {
+  getControladorVenta,
   resolveActiveStations,
   getActiveStationsList,
+  getAllActiveFuelStations,
+  getComEstacionIdForEstacion,
   getStationCapacities,
   preSeedStationTanksFromCapacities,
   seedStationTanks,
