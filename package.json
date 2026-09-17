@@ -18,6 +18,8 @@
     "jsonwebtoken": "^9.0.3",
     "jwks-rsa": "^3.2.2",
     "mssql": "^12.7.0",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "swagger-jsdoc": "^6.3.0",
+    "swagger-ui-express": "^5.0.1"
   }
 }
