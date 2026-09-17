@@ -8,10 +8,16 @@
 
 const DATE_FORMAT_REGEX = /^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}$/;
 
-// Orden fijo de VOX: checkboxesDispRepProd0/1/2 = SUPER/REGULAR/DIESEL (confirmado
-// contra el label real del checkbox, no es un supuesto). checkboxesDispRepPumpN =
-// Surtidor (N+1).
-const PRODUCTOS = ['SUPER', 'REGULAR', 'DIESEL'];
+// Ninguno de los fetch() contra VOX tenía timeout — si el equipo se cuelga de
+// verdad (no solo "lento"), el proceso Node quedaba esperando para siempre, sin
+// que el caller (getDispatchReport, y arriba de eso la ruta /dispatches) tuviera
+// forma de enterarse. Estos son solo la red de seguridad contra un cuelgue real,
+// no un límite ajustado al caso normal: un rango de 24hs con mucho tráfico midió
+// 151s de punta a punta en la práctica (TEXACO La Curva, 1374 registros), así que
+// FETCH_REPORT_TIMEOUT_MS queda con margen amplio sobre eso. login/fetchAllConfig
+// piden páginas chicas (no el reporte pesado) y no deberían tardar ni cerca de eso.
+const FETCH_LOGIN_TIMEOUT_MS = 30_000;
+const FETCH_REPORT_TIMEOUT_MS = 240_000;
 
 function formatVoxDate(date) {
   const pad = (n) => String(n).padStart(2, '0');
@@ -52,6 +58,7 @@ async function login(ip, usuario, password) {
       lastPage: 'index.php',
     }),
     redirect: 'manual',
+    signal: AbortSignal.timeout(FETCH_LOGIN_TIMEOUT_MS),
   });
 
   const cookie = extractCookie(loginResponse);
@@ -63,7 +70,25 @@ async function login(ip, usuario, password) {
 }
 
 /**
- * Extrae el bloque hidden "allConfig" del formulario de reporte de despachos.
+ * Lee los checkboxes de producto y surtidor realmente presentes en el formulario
+ * — no todas las estaciones tienen los mismos productos (algunas tienen KEROSENE
+ * además de SUPER/REGULAR/DIESEL) ni la misma cantidad de surtidores (algunas
+ * tienen más de 6), así que asumir una lista/cantidad fija dejaba productos y
+ * surtidores reales fuera de cualquier consulta que no los pidiera explícito
+ * (incluida la consulta "traer todo" cuando no se manda ningún filtro).
+ */
+function parseFormOptions(html) {
+  const productos = [...html.matchAll(/name="checkboxesDispRepProd(\d+)"[^>]*>\s*([^\s<]+)/g)].map((m) => ({
+    index: Number(m[1]),
+    nombre: m[2],
+  }));
+  const pumpIndexes = [...html.matchAll(/name="checkboxesDispRepPump(\d+)"/g)].map((m) => Number(m[1]));
+  return { productos, pumpIndexes };
+}
+
+/**
+ * Extrae el bloque hidden "allConfig" del formulario de reporte de despachos, junto
+ * con los productos/surtidores reales de esta estación (ver parseFormOptions).
  * Es estable entre sesiones (confirmado empíricamente) pero se re-obtiene fresco en
  * cada llamada para no depender de eso — el costo extra es una sola request GET.
  * OJO: la página trae DOS campos allConfig (uno por cada <form> de la pantalla) con
@@ -72,6 +97,7 @@ async function login(ip, usuario, password) {
 async function fetchAllConfig(ip, cookie) {
   const response = await fetch(`http://${ip}/dispatchsreport.php`, {
     headers: { Cookie: cookie },
+    signal: AbortSignal.timeout(FETCH_LOGIN_TIMEOUT_MS),
   });
   const html = await response.text();
 
@@ -83,7 +109,7 @@ async function fetchAllConfig(ip, cookie) {
   if (!match) {
     throw new Error('No se encontró el campo allConfig en dispatchsreport.php — ¿cambió el frontend de VOX?');
   }
-  return { sessionExpired: false, allConfig: match[1] };
+  return { sessionExpired: false, allConfig: match[1], formOptions: parseFormOptions(html) };
 }
 
 function parseSummary(html) {
@@ -140,11 +166,14 @@ function parseDispatchTable(html) {
  * Pide el reporte de despachos a VOX para un rango de fechas. `from`/`to` son Date.
  * No pagina del lado del servidor: siempre devuelve el rango completo.
  *
- * `productos` (nombres, ej. ['SUPER','DIESEL']) y `surtidores` (números 1-6) filtran
- * qué checkboxes se tildan — si se omiten (undefined), se tildan todos, igual que
- * antes de este cambio.
+ * `formOptions` (de fetchAllConfig/parseFormOptions) son los productos/surtidores
+ * REALES de esta estación — nunca se asume una lista/cantidad fija, porque varía
+ * por estación (algunas tienen KEROSENE, algunas tienen más de 6 surtidores).
+ * `productos` (nombres, ej. ['SUPER','DIESEL']) y `surtidores` (números, 1-based)
+ * filtran qué checkboxes de esa lista real se tildan — si se omiten (undefined),
+ * se tildan todos los que la estación realmente tiene.
  */
-async function fetchDispatchReport(ip, cookie, allConfig, from, to, { productos, surtidores } = {}) {
+async function fetchDispatchReport(ip, cookie, allConfig, formOptions, from, to, { productos, surtidores } = {}) {
   const params = new URLSearchParams();
   params.set('timestampFrom', formatVoxDate(from));
   params.set('timestampTo', formatVoxDate(to));
@@ -153,9 +182,13 @@ async function fetchDispatchReport(ip, cookie, allConfig, from, to, { productos,
   // si se manda "on" en vez del valor exacto (ver memoria: no devuelve error, devuelve
   // "No se obtuvieron reportes." como si no hubiera datos).
   const productIndexes = productos
-    ? productos.map((p) => PRODUCTOS.indexOf(p.toUpperCase())).filter((i) => i !== -1)
-    : [0, 1, 2];
-  const pumpIndexes = surtidores ? surtidores.map((n) => n - 1).filter((i) => i >= 0 && i <= 5) : [0, 1, 2, 3, 4, 5];
+    ? formOptions.productos
+        .filter((p) => productos.some((wanted) => wanted.toUpperCase() === p.nombre.toUpperCase()))
+        .map((p) => p.index)
+    : formOptions.productos.map((p) => p.index);
+  const pumpIndexes = surtidores
+    ? surtidores.map((n) => n - 1).filter((i) => formOptions.pumpIndexes.includes(i))
+    : formOptions.pumpIndexes;
 
   for (const i of productIndexes) params.set(`checkboxesDispRepProd${i}`, String(i));
   for (const i of pumpIndexes) params.set(`checkboxesDispRepPump${i}`, String(i));
@@ -168,6 +201,7 @@ async function fetchDispatchReport(ip, cookie, allConfig, from, to, { productos,
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: cookie },
     body: params,
+    signal: AbortSignal.timeout(FETCH_REPORT_TIMEOUT_MS),
   });
 
   const html = await response.text();
@@ -196,7 +230,7 @@ async function getDispatchReport({ ip, usuario, password }, from, to, filters = 
       continue;
     }
 
-    const reportResult = await fetchDispatchReport(ip, cookie, configResult.allConfig, from, to, filters);
+    const reportResult = await fetchDispatchReport(ip, cookie, configResult.allConfig, configResult.formOptions, from, to, filters);
     if (reportResult.sessionExpired) {
       cookie = await login(ip, usuario, password);
       continue;
@@ -209,4 +243,4 @@ async function getDispatchReport({ ip, usuario, password }, from, to, filters = 
   throw new Error(`VOX (${ip}): la sesión se venció incluso después de reintentar el login.`);
 }
 
-module.exports = { login, getDispatchReport, PRODUCTOS };
+module.exports = { login, getDispatchReport };

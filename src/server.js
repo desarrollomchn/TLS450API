@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
+const swaggerUi = require('swagger-ui-express');
 
 const { runOnce, initStations, getLiveReadings } = require('./monitor');
 const db = require('./db');
@@ -11,10 +12,13 @@ const {
   getAllActiveFuelStations,
   getComEstacionIdForEstacion,
   getControladorVenta,
+  updateControladorVenta,
+  getPumpConfig,
   updateTankThreshold,
 } = db;
 const voxClient = require('./voxClient');
 const { requireAuth } = require('./auth');
+const swaggerSpec = require('./swagger');
 
 const app = express();
 const PORT = process.env.API_PORT || 3000;
@@ -60,7 +64,30 @@ const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5100').spl
 app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
+/**
+ * @openapi
+ * /health:
+ *   get:
+ *     summary: Chequeo de vida del servicio
+ *     description: Endpoint trivial de liveness, sin autenticación. No consulta base de datos ni equipos.
+ *     security: []
+ *     tags: [Estaciones]
+ *     responses:
+ *       200:
+ *         description: El servicio está arriba.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 status: { type: string, example: ok }
+ */
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+// Docs sin auth (mismo patrón que /health) — deben quedar registradas ANTES de
+// app.use(requireAuth) para poder navegarse sin token.
+app.get('/swagger.json', (req, res) => res.json(swaggerSpec));
+app.use('/swagger', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 app.use(requireAuth);
 
@@ -68,12 +95,51 @@ app.use(requireAuth);
 // venta), backend del selector de estación en el frontend. El id es EstacionId
 // (gen_estaciones.Id) — ya no comEstacionId, para poder listar también las
 // estaciones que todavía no tienen Veeder-Root.
+/**
+ * @openapi
+ * /stations:
+ *   get:
+ *     summary: Lista las estaciones activas
+ *     description: Todas las estaciones activas con algún equipo monitoreado (Veeder-Root y/o controlador de venta). El `id` devuelto es siempre EstacionId (gen_estaciones.Id).
+ *     tags: [Estaciones]
+ *     responses:
+ *       200:
+ *         description: Listado de estaciones activas.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items: { $ref: '#/components/schemas/Station' }
+ */
 app.get('/stations', async (req, res) => {
   res.json(await getAllActiveFuelStations());
 });
 
 // GET /tanks?stationId= -> última lectura de cada tanque de la estación + % calculado
 // (stationId acá es EstacionId, no comEstacionId — ver resolveComEstacionId).
+/**
+ * @openapi
+ * /tanks:
+ *   get:
+ *     summary: Última lectura guardada de cada tanque de una estación
+ *     description: Lee la última lectura guardada en base (comb_lecturas), NO consulta el Veeder-Root en vivo — ver /tanks/live para eso. Incluye el % calculado y tanques provisionales (sin lectura todavía) con los campos de lectura en null.
+ *     tags: [Tanques]
+ *     parameters:
+ *       - in: query
+ *         name: stationId
+ *         schema: { type: integer }
+ *         required: false
+ *         description: EstacionId (gen_estaciones.Id). Si se omite, usa la estación piloto por defecto.
+ *         example: 4
+ *     responses:
+ *       200:
+ *         description: Lecturas de cada tanque de la estación (vacío si la estación no tiene Veeder-Root).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items: { $ref: '#/components/schemas/TankReading' }
+ */
 app.get('/tanks', async (req, res) => {
   const comEstacionId = await resolveComEstacionId(req);
   if (!comEstacionId) return res.json([]); // estación válida, sin Veeder-Root: no tiene tanques.
@@ -114,6 +180,34 @@ function getCachedLiveReadings(comEstacionId) {
 // GET /tanks/live?stationId= -> consulta el Veeder-Root de la estación (cacheado
 // LIVE_READINGS_CACHE_TTL_MS ms, compartido entre todos los viewers de la misma
 // estación), sin pasar por comb_lecturas.
+/**
+ * @openapi
+ * /tanks/live:
+ *   get:
+ *     summary: Lectura en vivo de cada tanque de una estación
+ *     description: Consulta directa al equipo Veeder-Root de la estación (no pasa por comb_lecturas), cacheada por hasta 20s y compartida entre todos los viewers de la misma estación para no saturar el equipo con lecturas TCP concurrentes.
+ *     tags: [Tanques]
+ *     parameters:
+ *       - in: query
+ *         name: stationId
+ *         schema: { type: integer }
+ *         required: false
+ *         description: EstacionId (gen_estaciones.Id). Si se omite, usa la estación piloto por defecto.
+ *         example: 4
+ *     responses:
+ *       200:
+ *         description: Lecturas en vivo de cada tanque de la estación (vacío si la estación no tiene Veeder-Root).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items: { $ref: '#/components/schemas/TankReading' }
+ *       502:
+ *         description: Falló la consulta al Veeder-Root.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ */
 app.get('/tanks/live', async (req, res) => {
   const comEstacionId = await resolveComEstacionId(req);
   if (!comEstacionId) return res.json([]);
@@ -127,6 +221,54 @@ app.get('/tanks/live', async (req, res) => {
 
 // PATCH /tanks/:id/threshold?stationId= -> actualiza el umbral de alerta (%) de un tanque.
 // Body: { umbralAlertaPorcentaje: number }
+/**
+ * @openapi
+ * /tanks/{id}/threshold:
+ *   patch:
+ *     summary: Actualiza el umbral de alerta (%) de un tanque
+ *     tags: [Tanques]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *         description: TankNumber del Veeder-Root (idTanque).
+ *         example: 2
+ *       - in: query
+ *         name: stationId
+ *         schema: { type: integer }
+ *         required: false
+ *         description: EstacionId (gen_estaciones.Id). Si se omite, usa la estación piloto por defecto.
+ *         example: 4
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [umbralAlertaPorcentaje]
+ *             properties:
+ *               umbralAlertaPorcentaje: { type: number, minimum: 0, maximum: 100, example: 20 }
+ *     responses:
+ *       200:
+ *         description: Umbral actualizado.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok: { type: boolean, example: true }
+ *       400:
+ *         description: umbralAlertaPorcentaje inválido.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ *       404:
+ *         description: La estación no tiene Veeder-Root, o el tanque no existe en esa estación.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ */
 app.patch('/tanks/:id/threshold', async (req, res) => {
   const comEstacionId = await resolveComEstacionId(req);
   const tankNumber = Number(req.params.id);
@@ -148,6 +290,45 @@ app.patch('/tanks/:id/threshold', async (req, res) => {
 });
 
 // GET /tanks/:id/history?stationId=&limit= -> histórico de lecturas de un tanque de una estación
+/**
+ * @openapi
+ * /tanks/{id}/history:
+ *   get:
+ *     summary: Histórico de lecturas de un tanque
+ *     tags: [Tanques]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *         description: TankNumber del Veeder-Root (idTanque).
+ *         example: 2
+ *       - in: query
+ *         name: stationId
+ *         schema: { type: integer }
+ *         required: false
+ *         description: EstacionId (gen_estaciones.Id). Si se omite, usa la estación piloto por defecto.
+ *         example: 4
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+ *         required: false
+ *         description: Cantidad máxima de lecturas a devolver, más recientes primero. Se recorta a un techo de 500.
+ *         example: 100
+ *     responses:
+ *       200:
+ *         description: Lecturas históricas del tanque, más recientes primero (vacío si la estación no tiene Veeder-Root).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items: { $ref: '#/components/schemas/TankHistoryEntry' }
+ *       400:
+ *         description: ':id no es un entero positivo.'
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ */
 app.get('/tanks/:id/history', async (req, res) => {
   const tankNumber = Number(req.params.id);
   if (!Number.isInteger(tankNumber) || tankNumber <= 0) {
@@ -199,12 +380,215 @@ async function getCachedDispatchReport(estacionId, credenciales, from, to, filte
   return report;
 }
 
-// GET /stations/:estacionId/dispatches?from=&to=&productos=&surtidores=&page=&pageSize=
+// GET /stations/:estacionId/pump-config -> productos y surtidores reales de la estación
+// (comb_bombas/comb_bahias, sincronizados desde Business Central), para que el frontend
+// arme los filtros de Dispensado sin asumir una cantidad fija de bahías ni una lista fija
+// de productos — no todas las estaciones tienen 6 surtidores ni solo DIESEL/REGULAR/SUPER.
+/**
+ * @openapi
+ * /stations/{estacionId}/pump-config:
+ *   get:
+ *     summary: Productos y surtidores reales de una estación
+ *     description: Sincronizados desde Business Central (comb_bombas/comb_bahias) — no asume una cantidad fija de surtidores ni una lista fija de productos.
+ *     tags: [Estaciones]
+ *     parameters:
+ *       - in: path
+ *         name: estacionId
+ *         required: true
+ *         schema: { type: integer }
+ *         description: EstacionId (gen_estaciones.Id).
+ *         example: 4
+ *     responses:
+ *       200:
+ *         description: Configuración de bombas de la estación (listas vacías si no tiene datos sincronizados todavía).
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/PumpConfig' }
+ *       400:
+ *         description: estacionId inválido.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ */
+app.get('/stations/:estacionId/pump-config', async (req, res) => {
+  const estacionId = Number(req.params.estacionId);
+  if (Number.isNaN(estacionId)) {
+    return res.status(400).json({ ok: false, error: 'estacionId inválido.' });
+  }
+
+  const config = await getPumpConfig(estacionId);
+  res.json(config);
+});
+
+// PATCH /stations/:estacionId/controlador-venta -> corrige ip/usuario/password del
+// controlador de venta (VOX/Fusion) ya registrado para esta estación. Los tres campos
+// van SOLO en el body JSON, nunca en la URL — una query string queda expuesta en logs
+// de acceso del servidor, de cualquier proxy en el medio, y en el historial del
+// navegador; mismo motivo por el que password ya iba por body, ahora aplicado también
+// a ip/usuario por consistencia. Cualquier campo omitido se deja como estaba. No crea
+// una fila nueva (ver scripts/seedControladoresVenta.js para dar de alta un controlador
+// en una estación que todavía no tiene uno).
+/**
+ * @openapi
+ * /stations/{estacionId}/controlador-venta:
+ *   patch:
+ *     summary: Corrige ip/usuario/password del controlador de venta ya registrado
+ *     description: >
+ *       No crea una fila nueva — la estación ya tiene que tener un controlador de venta
+ *       (VOX/Fusion) registrado. Cualquier campo omitido se deja como estaba. Nunca
+ *       devuelve la contraseña, ni siquiera la que se acaba de guardar.
+ *
+ *       IMPORTANTE (seguridad): ip/usuario/password van SOLO en el body JSON, NUNCA
+ *       como query param — una query string queda expuesta en logs de acceso del
+ *       servidor, de cualquier proxy intermedio, y en el historial del navegador.
+ *       Esto es una corrección deliberada: no volver a aceptar ninguno de estos tres
+ *       campos por query string.
+ *     tags: [Estaciones]
+ *     parameters:
+ *       - in: path
+ *         name: estacionId
+ *         required: true
+ *         schema: { type: integer }
+ *         description: EstacionId (gen_estaciones.Id).
+ *         example: 4
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               ip:
+ *                 type: string
+ *                 example: 192.168.1.50
+ *               usuario:
+ *                 type: string
+ *                 example: admin
+ *               password:
+ *                 type: string
+ *                 description: Contraseña del controlador de venta.
+ *                 example: '********'
+ *     responses:
+ *       200:
+ *         description: Controlador actualizado (nunca incluye la contraseña).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok: { type: boolean, example: true }
+ *       400:
+ *         description: estacionId inválido, o no se mandó ninguno de ip/usuario/password.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ *       404:
+ *         description: La estación no tiene un controlador de venta registrado para actualizar.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ */
+app.patch('/stations/:estacionId/controlador-venta', async (req, res) => {
+  const estacionId = Number(req.params.estacionId);
+  if (Number.isNaN(estacionId)) {
+    return res.status(400).json({ ok: false, error: 'estacionId inválido.' });
+  }
+
+  const { ip, usuario, password } = req.body ?? {};
+
+  if (ip === undefined && usuario === undefined && password === undefined) {
+    return res.status(400).json({ ok: false, error: 'Mandá al menos uno de: ip, usuario, password (todos en el body).' });
+  }
+
+  const updated = await updateControladorVenta(estacionId, { ip, usuario, password });
+  if (!updated) {
+    return res.status(404).json({ ok: false, error: 'Esa estación no tiene un controlador de venta registrado para actualizar.' });
+  }
+
+  // Nunca se devuelve la contraseña, ni siquiera la que se acaba de guardar.
+  res.json({ ok: true });
+});
+
+// GET /stations/:estacionId/dispatches?from=&to=&productos=&surtidores=
 // -> despachos de bomba de un controlador de venta (VOX por ahora; Fusion todavía no
 // está implementado). from/to son ISO 8601. productos/surtidores son listas separadas
 // por coma (ej. productos=SUPER,DIESEL&surtidores=1,3) — si se omiten, trae todos.
-// VOX no pagina del lado del servidor: pedimos el rango completo UNA vez y paginamos
-// acá sobre el array ya parseado.
+// Se devuelve el set completo de registros del rango en una sola respuesta; el
+// frontend pagina del lado del cliente sobre ese set ya cargado.
+/**
+ * @openapi
+ * /stations/{estacionId}/dispatches:
+ *   get:
+ *     summary: Reporte de despachos de bomba del controlador de venta de una estación
+ *     description: >
+ *       Solo soporta controladores VOX por ahora (Fusion todavía no está implementado).
+ *       Devuelve el set completo de registros del rango en una sola respuesta; el
+ *       frontend pagina del lado del cliente.
+ *
+ *       ADVERTENCIA DE LATENCIA: esta llamada es LENTA — en la práctica toma del orden
+ *       de ~56 segundos contra un equipo VOX real, porque consulta en vivo un sistema
+ *       legacy y no hay caché en el primer hit de cada combinación de filtros (los hits
+ *       siguientes con los mismos filtros exactos sí quedan cacheados 5 minutos). Una
+ *       respuesta tardía es esperable, no necesariamente un cuelgue.
+ *     tags: [Despachos]
+ *     parameters:
+ *       - in: path
+ *         name: estacionId
+ *         required: true
+ *         schema: { type: integer }
+ *         description: EstacionId (gen_estaciones.Id).
+ *         example: 4
+ *       - in: query
+ *         name: from
+ *         required: true
+ *         schema: { type: string, format: date-time }
+ *         description: Fecha/hora de inicio del rango, ISO 8601.
+ *         example: '2026-09-15T00:00:00.000Z'
+ *       - in: query
+ *         name: to
+ *         required: true
+ *         schema: { type: string, format: date-time }
+ *         description: Fecha/hora de fin del rango, ISO 8601. Debe ser posterior o igual a `from`.
+ *         example: '2026-09-16T00:00:00.000Z'
+ *       - in: query
+ *         name: productos
+ *         required: false
+ *         schema: { type: string }
+ *         description: Lista de productos separados por coma. Si se omite, trae todos.
+ *         example: 'SUPER,DIESEL'
+ *       - in: query
+ *         name: surtidores
+ *         required: false
+ *         schema: { type: string }
+ *         description: Lista de números de surtidor separados por coma. Si se omite, trae todos.
+ *         example: '1,3'
+ *     responses:
+ *       200:
+ *         description: Reporte de despachos del rango.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/DispatchesResponse' }
+ *       400:
+ *         description: estacionId inválido, o from/to inválidos/fuera de orden.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ *       404:
+ *         description: La estación no tiene controlador de venta registrado.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ *       501:
+ *         description: El sistema registrado no es VOX (Fusion todavía no soportado).
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ *       502:
+ *         description: Falló la consulta al controlador VOX.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ */
 app.get('/stations/:estacionId/dispatches', async (req, res) => {
   const estacionId = Number(req.params.estacionId);
   const from = new Date(req.query.from);
@@ -228,24 +612,15 @@ app.get('/stations/:estacionId/dispatches', async (req, res) => {
   const productos = req.query.productos ? String(req.query.productos).split(',') : undefined;
   const surtidores = req.query.surtidores ? String(req.query.surtidores).split(',').map(Number) : undefined;
 
-  const page = Math.max(1, Number(req.query.page) || 1);
-  const pageSize = Math.min(200, Math.max(1, Number(req.query.pageSize) || 50));
-
   try {
     const report = await getCachedDispatchReport(estacionId, credenciales, from, to, { productos, surtidores });
 
-    const start = (page - 1) * pageSize;
-    const records = report.records.slice(start, start + pageSize);
-
     res.json({
-      records,
+      records: report.records,
       totales: report.totals,
       ventasSinControl: report.ventasSinControl,
       cantidadDespachos: report.cantidadDespachos,
-      pagina: page,
-      tamanoPagina: pageSize,
       totalRegistros: report.records.length,
-      totalPaginas: Math.ceil(report.records.length / pageSize) || 1,
     });
   } catch (err) {
     res.status(502).json({ ok: false, error: err.message });
@@ -253,6 +628,41 @@ app.get('/stations/:estacionId/dispatches', async (req, res) => {
 });
 
 // POST /tanks/check-now?stationId= -> fuerza una consulta inmediata (todas las estaciones, o una sola)
+/**
+ * @openapi
+ * /tanks/check-now:
+ *   post:
+ *     summary: Fuerza una consulta inmediata al Veeder-Root
+ *     description: Consulta todas las estaciones si se omite stationId, o solo una si se especifica. No espera al próximo ciclo del cron de monitoreo.
+ *     tags: [Tanques]
+ *     parameters:
+ *       - in: query
+ *         name: stationId
+ *         schema: { type: integer }
+ *         required: false
+ *         description: EstacionId (gen_estaciones.Id). Si se omite, consulta todas las estaciones activas.
+ *         example: 4
+ *     responses:
+ *       200:
+ *         description: Consulta ejecutada.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok: { type: boolean, example: true }
+ *                 message: { type: string, example: Consulta ejecutada }
+ *       404:
+ *         description: La estación no tiene Veeder-Root.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ *       500:
+ *         description: Error ejecutando la consulta.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/ErrorResponse' }
+ */
 app.post('/tanks/check-now', async (req, res) => {
   try {
     let comEstacionId;

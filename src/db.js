@@ -1,5 +1,5 @@
 const sql = require('mssql');
-const { decrypt } = require('./crypto');
+const { decrypt, encrypt } = require('./crypto');
 
 const config = {
   server: process.env.MSSQL_SERVER,
@@ -466,8 +466,74 @@ async function getControladorVenta(estacionId) {
   };
 }
 
+/**
+ * Actualiza ip/usuario/password de un controlador de venta ya existente — solo
+ * pisa los campos provistos (undefined = no tocar), para poder corregir uno solo
+ * sin tener que reenviar los otros dos. No crea una fila nueva: esta estación ya
+ * tiene que tener un controlador registrado (ver seedControladoresVenta.js para
+ * dar de alta uno nuevo). Devuelve false si no había ninguna fila para actualizar.
+ */
+async function updateControladorVenta(estacionId, { ip, usuario, password }) {
+  await poolConnect;
+
+  const request = pool.request().input('estacionId', sql.Int, estacionId);
+  const sets = [];
+
+  if (ip !== undefined) {
+    request.input('ip', sql.VarChar, ip);
+    sets.push('Ip = @ip');
+  }
+  if (usuario !== undefined) {
+    request.input('usuario', sql.VarChar, usuario);
+    sets.push('Usuario = @usuario');
+  }
+  if (password !== undefined) {
+    const { cipherText, iv, authTag } = encrypt(password);
+    request.input('passwordCifrado', sql.VarBinary, cipherText);
+    request.input('iv', sql.VarBinary, iv);
+    request.input('authTag', sql.VarBinary, authTag);
+    sets.push('PasswordCifrado = @passwordCifrado', 'Iv = @iv', 'AuthTag = @authTag');
+  }
+
+  if (sets.length === 0) return false;
+
+  const result = await request.query(
+    `UPDATE comb_controladores_venta SET ${sets.join(', ')} WHERE EstacionId = @estacionId`
+  );
+  return result.rowsAffected[0] > 0;
+}
+
+/**
+ * Productos y surtidores (bahías) reales de una estación, para pintar los filtros
+ * de la pantalla de Dispensado sin quemar valores fijos en el frontend — no todas
+ * las estaciones tienen los mismos productos (algunas tienen KEROSENE) ni la misma
+ * cantidad de bahías (algunas tienen 12, no 6). Se lee de comb_bombas/comb_bahias,
+ * la copia local sincronizada desde Business Central (EstacionId = gen_estaciones.Id).
+ * Devuelve listas vacías si la estación no tiene datos sincronizados todavía.
+ */
+async function getPumpConfig(estacionId) {
+  await poolConnect;
+
+  const productosResult = await pool
+    .request()
+    .input('estacionId', sql.Int, estacionId)
+    .query('SELECT DISTINCT ItemNo AS producto FROM comb_bombas WHERE EstacionId = @estacionId ORDER BY producto');
+
+  const surtidoresResult = await pool
+    .request()
+    .input('estacionId', sql.Int, estacionId)
+    .query('SELECT DISTINCT PumpBayCode AS surtidor FROM comb_bahias WHERE EstacionId = @estacionId ORDER BY surtidor');
+
+  return {
+    productos: productosResult.recordset.map((r) => r.producto),
+    surtidores: surtidoresResult.recordset.map((r) => Number.parseInt(r.surtidor, 10)),
+  };
+}
+
 module.exports = {
   getControladorVenta,
+  updateControladorVenta,
+  getPumpConfig,
   resolveActiveStations,
   getActiveStationsList,
   getAllActiveFuelStations,
